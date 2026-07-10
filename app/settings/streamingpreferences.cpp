@@ -54,6 +54,7 @@
 #define SER_KEEPAWAKE "keepawake"
 #define SER_LANGUAGE "language"
 #define SER_AUDIO_RENDERER "audioRenderer"
+#define SER_AUDIOJITTERBUFFER "audiojitterbufferms"
 #define SER_RENDERER "renderer"
 #define SER_FRAMEPACINGMODE "framePacingMode"
 #define SER_FRAMEPRESENTMODE "presentMode"
@@ -180,6 +181,7 @@ void StreamingPreferences::reload()
                                                     static_cast<int>(Language::LANG_AUTO)).toInt());
     audioRenderer = static_cast<AudioRenderer>(settings.value(SER_AUDIO_RENDERER,
                                                     static_cast<int>(AudioRenderer::AUDIO_RENDERER_COREAUDIO)).toInt());
+    audioJitterBufferMs = qBound(30, settings.value(SER_AUDIOJITTERBUFFER, 80).toInt(), 150);
     renderer = static_cast<Renderer>(settings.value(SER_RENDERER,
                                                     static_cast<int>(Renderer::RENDERER_VT_METAL)).toInt());
     framePacingMode = static_cast<FramePacingMode>(settings.value(SER_FRAMEPACINGMODE,
@@ -388,6 +390,7 @@ void StreamingPreferences::save()
     settings.setValue(SER_CAPTURESYSKEYS, captureSysKeysMode);
     settings.setValue(SER_KEEPAWAKE, keepAwake);
     settings.setValue(SER_AUDIO_RENDERER, static_cast<int>(audioRenderer));
+    settings.setValue(SER_AUDIOJITTERBUFFER, audioJitterBufferMs);
     settings.setValue(SER_RENDERER, static_cast<int>(renderer));
     settings.setValue(SER_FRAMEPACINGMODE, static_cast<int>(framePacingMode));
     settings.setValue(SER_FRAMEPRESENTMODE, static_cast<int>(presentMode));

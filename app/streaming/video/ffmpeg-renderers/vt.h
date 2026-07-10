@@ -2,6 +2,9 @@
 
 #include "renderer.h"
 
+#include <cstdint>
+#include <mutex>
+
 #ifdef __OBJC__
 #import <Metal/Metal.h>
 class VTBaseRenderer : public IFFmpegRenderer {
@@ -14,6 +17,8 @@ public:
 protected:
     bool isAppleSilicon();
 
+    std::mutex m_HdrMetadataMutex;
+    uint64_t m_HdrMetadataGeneration;
     bool m_HdrMetadataChanged; // Manual reset
     CFDataRef m_MasteringDisplayColorVolume;
     CFDataRef m_ContentLightLevelInfo;

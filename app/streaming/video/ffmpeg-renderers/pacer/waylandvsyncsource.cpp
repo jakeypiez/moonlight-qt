@@ -26,7 +26,7 @@ WaylandVsyncSource::~WaylandVsyncSource()
     }
 }
 
-bool WaylandVsyncSource::initialize(SDL_Window* window, int)
+bool WaylandVsyncSource::initialize(SDL_Window* window, double)
 {
     SDL_SysWMinfo info;
 

@@ -7,7 +7,7 @@
 #include <chrono>
 #include <Limelight.h>
 
-static inline double pts90kToSeconds(int64_t pts90k)
+[[maybe_unused]] static inline double pts90kToSeconds(int64_t pts90k)
 {
     return static_cast<double>(pts90k) / 90000.0;
 }
@@ -19,11 +19,14 @@ FrameQueue& FrameQueue::instance()
 }
 
 FrameQueue::FrameQueue():
-    m_Capacity(5),
+    // PACER_MAX_OUTSTANDING_FRAMES budgets three queued frames, one current
+    // frame, and one frame being handed off. Keep the physical queue bounded
+    // to the same three-frame high-water mark so decoder surfaces cannot be
+    // exhausted by bursts of already-decoded IDR frames.
+    m_Capacity(3),
     m_Count(0),
     m_Head(0),
     m_Tail(0),
-    m_DroppedLast(false),
     m_HighWaterMark(3),
     m_Paused(true),
     m_ReadyTolerance90k(900), // 10ms
@@ -84,7 +87,6 @@ void FrameQueue::clear()
     m_Head = 0;
     m_Tail = 0;
     m_Count = 0;
-    m_DroppedLast = false;
     std::fill(m_Buffer.begin(), m_Buffer.end(), Entry {});
 }
 
@@ -159,41 +161,20 @@ int FrameQueue::unsafeEnqueue(AVFrame* frame, int frameDropTarget)
     entry.pts90k = frame ? frame->pts : 0;
     entry.enqueueTimeUs = LiGetMicroseconds();
 
-    // - always accept IDR
-    // - below HWM, accept normally
-    // - above HWM, alternate between dropping newest and replacing oldest
-    if (isFrameIDR(frame) || m_Count < frameDropTarget) {
-        if (m_Count == m_Capacity) {
-            Entry oldest = popEntry();
-            if (oldest.frame) {
-                FQLog("! dropped oldest frame, enqueue full [pts: %.3fs]\n", pts90kToSeconds(oldest.frame->pts));
-                dropFrame(oldest.frame);
-                dropCount = 1;
-            }
-        }
-
-        pushEntry(entry);
-        m_DroppedLast = false;
-    }
-    else {
-        if (!m_DroppedLast) {
-            FQLog("! dropped newest frame, enqueue alternate [pts: %.3fs]\n", pts90kToSeconds(frame->pts));
-            dropFrame(frame);
-            dropCount = 1;
-            m_DroppedLast = true;
-        }
-        else {
-            Entry oldest = popEntry();
-            if (oldest.frame) {
-                FQLog("! dropped oldest frame, enqueue alternate [pts: %.3fs]\n", pts90kToSeconds(oldest.frame->pts));
-                dropFrame(oldest.frame);
-                dropCount = 1;
-            }
-
-            pushEntry(entry);
-            m_DroppedLast = false;
+    // These frames have already been decoded, so IDR frames need no special
+    // protection in the presentation queue. When the queue is full, retain
+    // the newest frame and evict stale frames to minimize glass-to-glass age.
+    while (m_Count >= frameDropTarget) {
+        Entry oldest = popEntry();
+        if (oldest.frame) {
+            FQLog("! dropped oldest frame, keeping newest [pts: %.3fs]\n",
+                  pts90kToSeconds(oldest.frame->pts));
+            dropFrame(oldest.frame);
+            ++dropCount;
         }
     }
+
+    pushEntry(entry);
 
     return dropCount;
 }

@@ -85,7 +85,6 @@ class FrameQueue
     int m_Head;
     int m_Tail;
 
-    bool m_DroppedLast;
     int m_HighWaterMark;
     std::atomic<bool> m_Paused;
 

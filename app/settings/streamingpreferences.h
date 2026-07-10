@@ -186,6 +186,7 @@ public:
     Q_PROPERTY(CaptureSysKeysMode captureSysKeysMode MEMBER captureSysKeysMode NOTIFY captureSysKeysModeChanged)
     Q_PROPERTY(Language language MEMBER language NOTIFY languageChanged)
     Q_PROPERTY(AudioRenderer audioRenderer MEMBER audioRenderer NOTIFY audioRendererChanged)
+    Q_PROPERTY(int audioJitterBufferMs MEMBER audioJitterBufferMs NOTIFY audioJitterBufferMsChanged)
     Q_PROPERTY(Renderer renderer MEMBER renderer NOTIFY rendererChanged)
     Q_PROPERTY(FramePacingMode framePacingMode MEMBER framePacingMode NOTIFY framePacingModeChanged)
     Q_PROPERTY(PresentMode presentMode MEMBER presentMode NOTIFY presentModeChanged)
@@ -235,6 +236,7 @@ public:
     Language language;
     CaptureSysKeysMode captureSysKeysMode;
     AudioRenderer audioRenderer;
+    int audioJitterBufferMs;
     Renderer renderer;
     FramePacingMode framePacingMode;
     PresentMode presentMode;
@@ -279,6 +281,7 @@ signals:
     void keepAwakeChanged();
     void languageChanged();
     void audioRendererChanged();
+    void audioJitterBufferMsChanged();
     void rendererChanged();
     void framePacingModeChanged();
     void presentModeChanged();
@@ -292,4 +295,3 @@ private:
 
     QQmlEngine* m_QmlEngine;
 };
-

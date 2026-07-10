@@ -31,15 +31,10 @@ extern "C"
 // - 1 frame for deferred free
 #define PACER_MAX_OUTSTANDING_FRAMES (3 + 1 + 1)
 
-// Additional metadata attached to AVFrame
-typedef struct MLFrameData {
-    int64_t prevPts; // previous frame's pts
-} MLFrameData;
-
 class IVsyncSource {
 public:
     virtual ~IVsyncSource() {}
-    virtual bool initialize(SDL_Window* window, int displayFps) = 0;
+    virtual bool initialize(SDL_Window* window, double displayFps) = 0;
 
     // Asynchronous sources produce callbacks on their own, while synchronous
     // sources require calls to waitForVsync().
@@ -141,4 +136,5 @@ class FramePacer: public IFramePacer
     std::atomic<double> m_VsyncTimestamp {0};
     uint64_t m_VsyncIntervalQpc;
     double m_ewmaVsyncDriftQpc;
+    double m_LastVsyncDeadline;
 };

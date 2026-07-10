@@ -24,7 +24,7 @@ DxVsyncSource::~DxVsyncSource()
     }
 }
 
-bool DxVsyncSource::initialize(SDL_Window* window, int)
+bool DxVsyncSource::initialize(SDL_Window* window, double)
 {
     m_Gdi32Handle = LoadLibraryA("gdi32.dll");
     if (m_Gdi32Handle == nullptr) {

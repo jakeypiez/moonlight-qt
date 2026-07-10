@@ -12,7 +12,7 @@ public:
 
     virtual ~WaylandVsyncSource();
 
-    virtual bool initialize(SDL_Window* window, int displayFps) override;
+    virtual bool initialize(SDL_Window* window, double displayFps) override;
 
     virtual bool isAsync() override;
 
@@ -25,4 +25,3 @@ private:
     wl_surface* m_Surface;
     wl_callback* m_Callback;
 };
-

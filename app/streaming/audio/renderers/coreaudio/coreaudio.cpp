@@ -9,14 +9,92 @@
 
 #include <QtGlobal>
 #include <SDL.h>
+#include <cmath>
 #include <string>
 
-#define kRingBufferMaxSeconds 0.030
+namespace {
+
+constexpr double kMinimumRingBufferSeconds = 0.060;
+constexpr int kMaximumLocalQueueMs = 50;
+constexpr double kMinimumRebufferSeconds = 0.010;
+constexpr double kMaximumRebufferSeconds = 0.020;
+constexpr double kTransitionFadeSeconds = 0.001;
+constexpr uint32_t kSpatialBufferFrames = 4096;
+
+void fadeInterleavedIn(float* samples, uint32_t frames, uint32_t channels, uint32_t fadeFrames)
+{
+    fadeFrames = qMin(frames, fadeFrames);
+    if (fadeFrames == 0) {
+        return;
+    }
+
+    for (uint32_t frame = 0; frame < fadeFrames; frame++) {
+        const float gain = fadeFrames == 1 ? 1.0f : (float)frame / (fadeFrames - 1);
+        for (uint32_t channel = 0; channel < channels; channel++) {
+            samples[frame * channels + channel] *= gain;
+        }
+    }
+}
+
+void fadeInterleavedOut(float* samples, uint32_t frames, uint32_t channels, uint32_t fadeFrames)
+{
+    fadeFrames = qMin(frames, fadeFrames);
+    if (fadeFrames == 0) {
+        return;
+    }
+
+    const uint32_t firstFadeFrame = frames - fadeFrames;
+    for (uint32_t frame = 0; frame < fadeFrames; frame++) {
+        const float gain = fadeFrames == 1 ? 0.0f : 1.0f - (float)frame / (fadeFrames - 1);
+        for (uint32_t channel = 0; channel < channels; channel++) {
+            samples[(firstFadeFrame + frame) * channels + channel] *= gain;
+        }
+    }
+}
+
+void fadeInterleavedFromLast(float* samples,
+                             uint32_t frames,
+                             uint32_t channels,
+                             uint32_t fadeFrames,
+                             const std::vector<float>& lastSamples)
+{
+    fadeFrames = qMin(frames, fadeFrames);
+    if (fadeFrames == 0 || lastSamples.size() < channels) {
+        return;
+    }
+
+    for (uint32_t frame = 0; frame < fadeFrames; frame++) {
+        const float gain = fadeFrames == 1 ? 0.0f : 1.0f - (float)frame / (fadeFrames - 1);
+        for (uint32_t channel = 0; channel < channels; channel++) {
+            samples[frame * channels + channel] = lastSamples[channel] * gain;
+        }
+    }
+}
+
+void crossfadeInterleavedFromLast(float* samples,
+                                  uint32_t frames,
+                                  uint32_t channels,
+                                  uint32_t fadeFrames,
+                                  const std::vector<float>& lastSamples)
+{
+    fadeFrames = qMin(frames, fadeFrames);
+    if (fadeFrames == 0 || lastSamples.size() < channels) {
+        return;
+    }
+
+    for (uint32_t frame = 0; frame < fadeFrames; frame++) {
+        const float mix = fadeFrames == 1 ? 1.0f : (float)frame / (fadeFrames - 1);
+        for (uint32_t channel = 0; channel < channels; channel++) {
+            float& sample = samples[frame * channels + channel];
+            sample = lastSamples[channel] * (1.0f - mix) + sample * mix;
+        }
+    }
+}
+
+}
 
 CoreAudioRenderer::CoreAudioRenderer()
     : m_SpatialBuffer(2, 4096),
-    m_DropCount(0),
-    m_DropCountUnderrun(0),
     m_QueuedAudioSize{0}
 {
     DEBUG_TRACE("CoreAudioRenderer construct");
@@ -54,23 +132,29 @@ void CoreAudioRenderer::cleanup()
 {
     DEBUG_TRACE("CoreAudioRenderer cleanup");
 
-    if (m_OutputDeviceID) {
+    if (m_ListenersInitialized) {
         deinitListeners();
-        m_OutputDeviceID = 0;
+        m_ListenersInitialized = false;
     }
+    m_OutputDeviceID = 0;
 
     if (m_OutputAU != nullptr) {
         AudioOutputUnitStop(m_OutputAU);
+        if (m_OutputInitialized) {
+            AudioUnitUninitialize(m_OutputAU);
+            m_OutputInitialized = false;
+        }
         clearCallback();
 
         m_SpatialAU.cleanup();
 
-        AudioUnitUninitialize(m_OutputAU);
         AudioComponentInstanceDispose(m_OutputAU);
         m_OutputAU = nullptr;
     }
 
-    TPCircularBufferCleanup(&m_RingBuffer);
+    if (m_RingBuffer.buffer != nullptr) {
+        TPCircularBufferCleanup(&m_RingBuffer);
+    }
 
     if (m_OutputDeviceName) {
         free(m_OutputDeviceName);
@@ -97,26 +181,24 @@ void CoreAudioRenderer::statsIncDeviceOverload()
 // realtime method
 void CoreAudioRenderer::statsTrackRender(uint64_t startTimeUs, const AudioTimeStamp *inTimestamp, uint32_t inNumberFrames, bool didUnderrun)
 {
+    Q_UNUSED(startTimeUs);
+
     // If no audio is playing, it's normal to get many underruns in a row.
     // We will only increment the underrun stat for the first empty buffer and
     // require some audio data before counting it again.
-    static bool seenAudio = true;
     if (didUnderrun) {
-        if (seenAudio) {
+        if (m_SeenAudio) {
             ++m_DropCountUnderrun;
-            seenAudio = false;
+            m_SeenAudio = false;
         }
     } else {
-        seenAudio = true;
+        m_SeenAudio = true;
     }
 
     // check for lost packets because we weren't called in time, possibly due to system overload
     if (m_LastSampleTime && inTimestamp->mFlags & kAudioTimeStampSampleTimeValid) {
-        double expectedSampleTime = m_LastSampleTime + inNumberFrames;
+        double expectedSampleTime = m_LastSampleTime + m_LastNumFrames;
         if (expectedSampleTime != inTimestamp->mSampleTime) {
-            uint32_t lostFrames = (inTimestamp->mSampleTime - m_LastSampleTime) - m_LastNumFrames;
-            double lostDuration = (double)lostFrames / 48000.0;
-
             //m_ActiveWndAudioStats.totalGlitches++;
 
 // #ifdef COREAUDIO_DEBUG
@@ -151,32 +233,101 @@ OSStatus renderCallbackDirect(void *inRefCon,
     uint64_t start = LiGetMicroseconds();
 
     CoreAudioRenderer *me = (CoreAudioRenderer *)inRefCon;
-    int bytesToCopy = ioData->mBuffers[0].mDataByteSize;
-    float *targetBuffer = (float *)ioData->mBuffers[0].mData;
+    bool didUnderrun = false;
+
+    if (ioActionFlags == nullptr) {
+        return kAudio_ParamError;
+    }
+
+    if (ioData == nullptr || ioData->mNumberBuffers != 1 ||
+            ioData->mBuffers[0].mData == nullptr || me->m_BytesPerFrame == 0) {
+        if (ioData != nullptr) {
+            for (uint32_t i = 0; i < ioData->mNumberBuffers; i++) {
+                if (ioData->mBuffers[i].mData != nullptr) {
+                    memset(ioData->mBuffers[i].mData, 0, ioData->mBuffers[i].mDataByteSize);
+                }
+            }
+        }
+        *ioActionFlags |= kAudioUnitRenderAction_OutputIsSilence;
+        me->m_Rebuffering = true;
+        me->m_FadeInPending = true;
+        me->statsTrackRender(start, inTimestamp, inNumberFrames, true);
+        return noErr;
+    }
+
+    AudioBuffer& output = ioData->mBuffers[0];
+    float *targetBuffer = (float *)output.mData;
+    const uint32_t channelCount = me->m_opusConfig->channelCount;
+    const uint32_t requestedBytes = qMin(output.mDataByteSize,
+                                         inNumberFrames * me->m_BytesPerFrame) /
+                                    me->m_BytesPerFrame * me->m_BytesPerFrame;
+    const uint32_t requestedFrames = requestedBytes / me->m_BytesPerFrame;
+    memset(targetBuffer, 0, output.mDataByteSize);
 
     // Pull audio from playthrough buffer
-    uint32_t availableBytes;
+    uint32_t availableBytes = 0;
     float *buffer = (float *)TPCircularBufferTail(&me->m_RingBuffer, &availableBytes);
 
-    // Optionally force a minimum buffer size before playback
-    bool buffering = false;
-    uint32_t channelCount = ioData->mNumberBuffers;
-    float queuedAudioMs = (float)availableBytes / (48 * channelCount * sizeof(float));
-    if (queuedAudioMs < 20.0) {
-        buffering = true;
+    // Start and resume only after enough PCM is queued to absorb normal packet
+    // arrival jitter. Once running, don't stop until we actually underrun.
+    if (me->m_Rebuffering &&
+            (availableBytes < me->m_RebufferThresholdBytes || availableBytes < requestedBytes)) {
+        *ioActionFlags |= kAudioUnitRenderAction_OutputIsSilence;
+        me->m_QueuedAudioSize.store(availableBytes);
+        me->statsTrackRender(start, inTimestamp, inNumberFrames, true);
+        return noErr;
     }
 
-    if ((int)availableBytes < bytesToCopy) {
-        // write silence if not enough buffered data is available
-        memset(targetBuffer, 0, bytesToCopy);
-        *ioActionFlags |= kAudioUnitRenderAction_OutputIsSilence;
-    } else {
-        const int bytesCopied = qMin(bytesToCopy, (int)availableBytes);
+    if (me->m_Rebuffering) {
+        me->m_Rebuffering = false;
+        me->m_FadeInPending = true;
+    }
+
+    const uint32_t availableFrames = availableBytes / me->m_BytesPerFrame;
+    const uint32_t framesCopied = qMin(requestedFrames, availableFrames);
+    const uint32_t bytesCopied = framesCopied * me->m_BytesPerFrame;
+
+    if (bytesCopied != 0) {
         memcpy(targetBuffer, buffer, bytesCopied);
         TPCircularBufferConsume(&me->m_RingBuffer, bytesCopied);
+
+        if (me->m_FadeInPending) {
+            fadeInterleavedIn(targetBuffer, framesCopied, channelCount, me->m_FadeFrames);
+            me->m_FadeInPending = false;
+        }
     }
 
-    me->statsTrackRender(start, inTimestamp, inNumberFrames, *ioActionFlags & kAudioUnitRenderAction_OutputIsSilence);
+    if (framesCopied < requestedFrames) {
+        didUnderrun = true;
+        me->m_Rebuffering = true;
+        me->m_FadeInPending = true;
+
+        if (framesCopied != 0) {
+            fadeInterleavedOut(targetBuffer, framesCopied, channelCount, me->m_FadeFrames);
+        }
+        else if (me->m_HasLastOutput) {
+            fadeInterleavedFromLast(targetBuffer,
+                                    requestedFrames,
+                                    channelCount,
+                                    me->m_FadeFrames,
+                                    me->m_LastOutputSamples);
+        }
+        else {
+            *ioActionFlags |= kAudioUnitRenderAction_OutputIsSilence;
+        }
+
+        me->m_HasLastOutput = false;
+    }
+    else if (framesCopied != 0) {
+        const float *lastFrame = targetBuffer + (framesCopied - 1) * channelCount;
+        for (uint32_t channel = 0; channel < channelCount; channel++) {
+            me->m_LastOutputSamples[channel] = lastFrame[channel];
+        }
+        me->m_HasLastOutput = true;
+    }
+
+    me->m_QueuedAudioSize.store(availableBytes - bytesCopied);
+    me->statsTrackRender(start, inTimestamp, inNumberFrames, didUnderrun);
 
     return noErr;
 }
@@ -193,28 +344,58 @@ OSStatus renderCallbackSpatial(void *inRefCon,
     CoreAudioRenderer *me = (CoreAudioRenderer *)inRefCon;
     AudioBufferList *spatialBuffer = me->m_SpatialBuffer.get();
 
-    // SpatialAU's inputCallback can't return a status via ioActionFlags, so we need to track underruns here
-    uint32_t availableBytes;
-    TPCircularBufferTail(&me->m_RingBuffer, &availableBytes);
-    uint32_t channelCount = ioData->mNumberBuffers;
-    uint32_t wantedBytes  = channelCount * inNumberFrames * sizeof(float);
-    bool didUnderrun = false;
-    if (availableBytes < wantedBytes) {
-        didUnderrun = true;
+    if (ioData == nullptr || ioActionFlags == nullptr) {
+        return kAudio_ParamError;
+    }
+
+    if (inNumberFrames > kSpatialBufferFrames) {
+        for (uint32_t i = 0; i < ioData->mNumberBuffers; i++) {
+            if (ioData->mBuffers[i].mData != nullptr) {
+                memset(ioData->mBuffers[i].mData, 0, ioData->mBuffers[i].mDataByteSize);
+            }
+        }
+        *ioActionFlags |= kAudioUnitRenderAction_OutputIsSilence;
+        me->statsTrackRender(start, inTimestamp, inNumberFrames, true);
+        return noErr;
     }
 
     // Set the byte size with the output audio buffer list.
     for (uint32_t i = 0; i < spatialBuffer->mNumberBuffers; i++) {
-        spatialBuffer->mBuffers[i].mDataByteSize = inNumberFrames * 4;
+        spatialBuffer->mBuffers[i].mDataByteSize = inNumberFrames * sizeof(float);
+        memset(spatialBuffer->mBuffers[i].mData, 0, spatialBuffer->mBuffers[i].mDataByteSize);
     }
 
     // Process the input frames with the audio unit spatial mixer.
-    me->m_SpatialAU.process(spatialBuffer, ioActionFlags, inTimestamp, inNumberFrames);
+    OSStatus status = me->m_SpatialAU.process(spatialBuffer, ioActionFlags, inTimestamp, inNumberFrames);
+    bool didUnderrun = me->m_SpatialAU.takeUnderrun();
 
     // Copy the temporary buffer to the output.
-    for (uint32_t i = 0; i < spatialBuffer->mNumberBuffers; i++) {
-        memcpy(ioData->mBuffers[i].mData, spatialBuffer->mBuffers[i].mData, inNumberFrames * sizeof(float));
+    for (uint32_t i = 0; i < ioData->mNumberBuffers; i++) {
+        AudioBuffer& output = ioData->mBuffers[i];
+        if (output.mData == nullptr) {
+            didUnderrun = true;
+            continue;
+        }
+        const uint32_t bytesToCopy = qMin(output.mDataByteSize, inNumberFrames * (uint32_t)sizeof(float));
+        if (status == noErr && i < spatialBuffer->mNumberBuffers) {
+            memcpy(output.mData, spatialBuffer->mBuffers[i].mData, bytesToCopy);
+            if (bytesToCopy < output.mDataByteSize) {
+                memset((char *)output.mData + bytesToCopy, 0, output.mDataByteSize - bytesToCopy);
+            }
+        }
+        else {
+            memset(output.mData, 0, output.mDataByteSize);
+        }
     }
+
+    if (status != noErr) {
+        *ioActionFlags |= kAudioUnitRenderAction_OutputIsSilence;
+        didUnderrun = true;
+    }
+
+    uint32_t availableBytes = 0;
+    TPCircularBufferTail(&me->m_RingBuffer, &availableBytes);
+    me->m_QueuedAudioSize.store(availableBytes);
 
     me->statsTrackRender(start, inTimestamp, inNumberFrames, didUnderrun);
 
@@ -226,8 +407,38 @@ bool CoreAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATION*
     OSStatus status = noErr;
     m_opusConfig = opusConfig;
 
+    if (m_OutputAU == nullptr || opusConfig == nullptr || opusConfig->sampleRate <= 0 ||
+            opusConfig->samplesPerFrame <= 0 || opusConfig->channelCount <= 0) {
+        return false;
+    }
+
+    StreamingPreferences *prefs = StreamingPreferences::get();
+    m_JitterBufferMs = qBound(30, prefs->audioJitterBufferMs, 150);
+
     // Request the OS set our buffer close to the Opus packet size
-    m_AudioPacketDuration = (opusConfig->samplesPerFrame / (opusConfig->sampleRate / 1000)) / 1000.0;
+    m_AudioPacketDuration = (double)opusConfig->samplesPerFrame / opusConfig->sampleRate;
+    m_BytesPerFrame = opusConfig->channelCount * sizeof(float);
+
+    const double rebufferSeconds = qBound(kMinimumRebufferSeconds,
+                                           m_AudioPacketDuration * 3.0,
+                                           kMaximumRebufferSeconds);
+    const uint32_t rebufferFrames = (uint32_t)ceil(rebufferSeconds * opusConfig->sampleRate);
+    m_RebufferThresholdBytes = rebufferFrames * m_BytesPerFrame;
+    m_FadeFrames = qMax(1U, (uint32_t)ceil(kTransitionFadeSeconds * opusConfig->sampleRate));
+    m_Rebuffering = true;
+    m_FadeInPending = true;
+    m_HasLastOutput = false;
+    m_HadProducerDrop = false;
+
+    const size_t samplesPerPacket = (size_t)opusConfig->samplesPerFrame * opusConfig->channelCount;
+    m_DecodeBuffer.resize(samplesPerPacket);
+    m_LastOutputSamples.assign(opusConfig->channelCount, 0.0f);
+    m_LastQueuedSamples.assign(opusConfig->channelCount, 0.0f);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "CoreAudioRenderer jitter buffer: %d ms; rebuffer target: %.1f ms",
+                m_JitterBufferMs,
+                rebufferSeconds * 1000.0);
 
     if (!initAudioUnit()) {
         DEBUG_TRACE("initAudioUnit failed");
@@ -239,6 +450,9 @@ bool CoreAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATION*
         return false;
     }
 
+    // Cleanup removes all listener registrations and safely tolerates selectors
+    // that were not added, so mark this before the first incremental add.
+    m_ListenersInitialized = true;
     if (!initListeners()) {
         DEBUG_TRACE("initListeners failed");
         return false;
@@ -255,7 +469,6 @@ bool CoreAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATION*
         }
     }
 
-    StreamingPreferences *prefs = StreamingPreferences::get();
     if (prefs->spatialAudioConfig == StreamingPreferences::SAC_DISABLED) {
         // User has disabled spatial audio
         DEBUG_TRACE("CoreAudioRenderer user has disabled spatial audio");
@@ -277,10 +490,14 @@ bool CoreAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATION*
 
     if (m_Spatial) {
         // render audio for binaural headphones or built-in laptop speakers
-        setCallback(renderCallbackSpatial);
+        if (!setCallback(renderCallbackSpatial)) {
+            return false;
+        }
 
-        // this callback is non-interleaved
+        // The spatial mixer consumes the multichannel ring buffer internally,
+        // but its output to the HAL is always non-interleaved stereo.
         streamDesc.mFormatFlags    |= kAudioFormatFlagIsNonInterleaved;
+        streamDesc.mChannelsPerFrame = 2;
         streamDesc.mBytesPerPacket = 4;
         streamDesc.mBytesPerFrame  = 4;
 
@@ -288,7 +505,10 @@ bool CoreAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATION*
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "CoreAudioRenderer is using spatial audio output");
 
-        if (!m_SpatialAU.setup(outputType, opusConfig->sampleRate, opusConfig->channelCount)) {
+        if (!m_SpatialAU.setup(outputType,
+                               opusConfig->sampleRate,
+                               opusConfig->channelCount,
+                               opusConfig->samplesPerFrame)) {
             DEBUG_TRACE("m_SpatialAU.setup failed");
             return false;
         }
@@ -296,7 +516,9 @@ bool CoreAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATION*
         m_TotalSoftwareLatency += m_SpatialAU.getAudioUnitLatency();
     } else {
         // direct passthrough of all channels for stereo and HDMI
-        setCallback(renderCallbackDirect);
+        if (!setCallback(renderCallbackDirect)) {
+            return false;
+        }
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "CoreAudioRenderer is using passthrough mode");
     }
@@ -306,6 +528,27 @@ bool CoreAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATION*
         CA_LogError(status, "Failed to set output stream format");
         return false;
     }
+
+    uint32_t maximumFramesPerSlice = kSpatialBufferFrames;
+    status = AudioUnitSetProperty(m_OutputAU,
+                                  kAudioUnitProperty_MaximumFramesPerSlice,
+                                  kAudioUnitScope_Global,
+                                  0,
+                                  &maximumFramesPerSlice,
+                                  sizeof(maximumFramesPerSlice));
+    if (status != noErr) {
+        // Some output devices expose this as read-only. The callback still
+        // guards the fixed spatial scratch capacity, so retain compatibility.
+        CA_LogError(status, "Unable to set maximum output frames per slice; using device default");
+    }
+
+    // Configure the device, stream format, and callback before initializing.
+    status = AudioUnitInitialize(m_OutputAU);
+    if (status != noErr) {
+        CA_LogError(status, "Failed to initialize the output audio unit");
+        return false;
+    }
+    m_OutputInitialized = true;
 
     DEBUG_TRACE("CoreAudioRenderer start");
     status = AudioOutputUnitStart(m_OutputAU);
@@ -335,25 +578,16 @@ bool CoreAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATION*
 void CoreAudioRenderer::updateMetrics()
 {
     DevUISettings::instance().UpdateMetrics([&](DevUIMetrics& metrics) {
-        metrics.audioDropCount += m_DropCount;
-        metrics.audioDropCountUnderrun += m_DropCountUnderrun;
-        int bytesPerMs = (m_OutputASBD.mSampleRate * m_opusConfig->channelCount * sizeof(float)) / 1000;
+        metrics.audioDropCount += m_DropCount.exchange(0);
+        metrics.audioDropCountUnderrun += m_DropCountUnderrun.exchange(0);
+        int bytesPerMs = (m_opusConfig->sampleRate * m_opusConfig->channelCount * sizeof(float)) / 1000;
         metrics.audioInBufferMs = (float)m_QueuedAudioSize.load() / bytesPerMs;
-
-        // Let DevUI reset the counters to 0
-        m_DropCount = 0;
-        m_DropCountUnderrun = 0;
     });
 }
 
 bool CoreAudioRenderer::initAudioUnit()
 {
-    // Initialize the audio unit interface to begin configuring it.
-    OSStatus status = AudioUnitInitialize(m_OutputAU);
-    if (status != noErr) {
-        CA_LogError(status, "Failed to initialize the output audio unit");
-        return false;
-    }
+    OSStatus status = noErr;
 
     /* macOS:
      * disable OutputAU input IO
@@ -474,13 +708,16 @@ bool CoreAudioRenderer::initAudioUnit()
         double desiredBufferFrameSize = m_AudioPacketDuration;
         desiredBufferFrameSize = qMax(qMin(desiredBufferFrameSize, m_OutputSoftwareLatencyMax), m_OutputSoftwareLatencyMin);
         uint32_t bufferFrameSize = (uint32_t)(desiredBufferFrameSize * m_OutputASBD.mSampleRate);
-        AudioObjectPropertyAddress addrSet{kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain};
+        AudioObjectPropertyAddress addrSet{kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain};
         status = AudioObjectSetPropertyData(m_OutputDeviceID, &addrSet, 0, NULL, sizeof(uint32_t), &bufferFrameSize);
         if (status != noErr) {
-            CA_LogError(status, "Failed to set the output device buffer frame size");
-            return false;
+            // Bluetooth, aggregate, and virtual devices may not allow clients
+            // to change this value. Continue with the current device size.
+            CA_LogError(status, "Unable to set output device buffer frame size; using device default");
         }
-        DEBUG_TRACE("CoreAudioRenderer output requested BufferFrameSize of %d (%0.3f ms)", bufferFrameSize, desiredBufferFrameSize * 1000.0);
+        else {
+            DEBUG_TRACE("CoreAudioRenderer output requested BufferFrameSize of %d (%0.3f ms)", bufferFrameSize, desiredBufferFrameSize * 1000.0);
+        }
 
         // see what we got
         uint32_t size = sizeof(uint32_t);
@@ -540,8 +777,10 @@ bool CoreAudioRenderer::initAudioUnit()
 
 bool CoreAudioRenderer::initRingBuffer()
 {
-    // Always buffer at least 2 packets, up to 30ms worth of packets
-    int packetsToBuffer = qMax(2, (int)ceil(kRingBufferMaxSeconds / m_AudioPacketDuration));
+    // Keep decoded PCM bounded independently of the configurable pre-decode
+    // jitter window. submitAudio() applies backpressure above 50 ms so network
+    // bursts remain in Moonlight's packet queue instead of becoming stale PCM.
+    int packetsToBuffer = qMax(4, (int)ceil(kMinimumRingBufferSeconds / m_AudioPacketDuration));
 
     bool ok = TPCircularBufferInit(&m_RingBuffer,
                                    sizeof(float) *
@@ -639,7 +878,7 @@ bool CoreAudioRenderer::setCallback(AURenderCallback callback)
     callbackStruct.inputProc = callback;
     callbackStruct.inputProcRefCon = this;
 
-    OSStatus status = AudioUnitSetProperty(m_OutputAU, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Output, 0, &callbackStruct, sizeof(callbackStruct));
+    OSStatus status = AudioUnitSetProperty(m_OutputAU, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &callbackStruct, sizeof(callbackStruct));
     if (status != noErr) {
         CA_LogError(status, "Failed to set output render callback");
         return false;
@@ -654,7 +893,7 @@ void CoreAudioRenderer::clearCallback()
     callbackStruct.inputProc = nullptr;
     callbackStruct.inputProcRefCon = nullptr;
 
-    OSStatus status = AudioUnitSetProperty(m_OutputAU, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Output, 0, &callbackStruct, sizeof(callbackStruct));
+    OSStatus status = AudioUnitSetProperty(m_OutputAU, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &callbackStruct, sizeof(callbackStruct));
     if (status != noErr) {
         CA_LogError(status, "Error clearing output render callback");
     }
@@ -662,19 +901,15 @@ void CoreAudioRenderer::clearCallback()
 
 void* CoreAudioRenderer::getAudioBuffer(int* size)
 {
-    // We must always write a full frame of audio. If we don't,
-    // the reader will get out of sync with the writer and our
-    // channels will get all mixed up. To ensure this is always
-    // the case, round our bytes free down to the next multiple
-    // of our frame size.
-    uint32_t bytesFree;
-    void *ptr = TPCircularBufferHead(&m_RingBuffer, &bytesFree);
-    int bytesPerFrame = m_opusConfig->channelCount * sizeof(float);
-    *size = qMin(*size, (int)(bytesFree / bytesPerFrame) * bytesPerFrame);
+    // Decode into a guaranteed full-packet staging buffer. Decoding directly
+    // into the ring's remaining space could give Opus a partial output frame,
+    // which returns OPUS_BUFFER_TOO_SMALL and advances the stream discontinuously.
+    const int stagingBytes = (int)(m_DecodeBuffer.size() * sizeof(float));
+    if (*size > stagingBytes) {
+        *size = stagingBytes;
+    }
 
-    m_BufferFilledBytes = m_RingBuffer.length - bytesFree;
-
-    return ptr;
+    return m_DecodeBuffer.data();
 }
 
 bool CoreAudioRenderer::submitAudio(int bytesWritten)
@@ -689,21 +924,96 @@ bool CoreAudioRenderer::submitAudio(int bytesWritten)
         return true;
     }
 
-    // drop packet if we've fallen behind Moonlight's queue by at least 30 ms
-    if (LiGetPendingAudioDuration() > 60) {
+    const int stagingBytes = (int)(m_DecodeBuffer.size() * sizeof(float));
+    if (bytesWritten < 0 || bytesWritten > stagingBytes ||
+            m_BytesPerFrame == 0 || (bytesWritten % m_BytesPerFrame) != 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "CoreAudioRenderer received invalid decoded buffer size: %d",
+                     bytesWritten);
+        return false;
+    }
+
+    uint32_t queuedBytes = 0;
+    TPCircularBufferTail(&m_RingBuffer, &queuedBytes);
+    const int bytesPerMs = m_opusConfig->sampleRate * m_BytesPerFrame / 1000;
+    const int queuedAudioMs = bytesPerMs == 0 ? 0 : queuedBytes / bytesPerMs;
+    const int totalQueuedAudioMs = LiGetPendingAudioDuration() + queuedAudioMs;
+
+    // Do not punch a hole in an already-starved output queue. We only catch up
+    // when the compressed queue exceeds the user's tolerance and local PCM is
+    // safely above the rebuffer low-water mark.
+    if (totalQueuedAudioMs >= m_JitterBufferMs &&
+            queuedBytes >= m_RebufferThresholdBytes) {
         ++m_DropCount;
+        m_HadProducerDrop = true;
         return true;
     }
 
-    // Advance the write pointer
+    uint32_t bytesFree = 0;
+    void *ringHead = nullptr;
+    bool canQueue = false;
+
+    // Match SDL's bounded output queue behavior. Waiting here keeps burst data
+    // in the pre-decode queue where the user-selected jitter limit can govern
+    // it, rather than permanently inflating playout latency.
+    for (int i = 0; i < 100; i++) {
+        TPCircularBufferTail(&m_RingBuffer, &queuedBytes);
+        ringHead = TPCircularBufferHead(&m_RingBuffer, &bytesFree);
+        const int localQueueMs = bytesPerMs == 0 ? 0 : queuedBytes / bytesPerMs;
+        if (localQueueMs <= kMaximumLocalQueueMs &&
+                ringHead != nullptr && bytesWritten <= (int)bytesFree) {
+            canQueue = true;
+            break;
+        }
+
+        if (m_needsReinit.load()) {
+            return false;
+        }
+        SDL_Delay(1);
+    }
+
+    if (!canQueue) {
+        ++m_DropCount;
+        m_HadProducerDrop = true;
+        return true;
+    }
+
+    float *decodedSamples = m_DecodeBuffer.data();
+    const uint32_t channelCount = m_opusConfig->channelCount;
+    const uint32_t framesWritten = bytesWritten / m_BytesPerFrame;
+
+    // If one or more packets were intentionally skipped, blend the next PCM
+    // block from the last enqueued sample to avoid a hard waveform step.
+    if (m_HadProducerDrop && framesWritten != 0) {
+        crossfadeInterleavedFromLast(decodedSamples,
+                                     framesWritten,
+                                     channelCount,
+                                     m_FadeFrames,
+                                     m_LastQueuedSamples);
+        m_HadProducerDrop = false;
+    }
+
+    memcpy(ringHead, decodedSamples, bytesWritten);
     TPCircularBufferProduce(&m_RingBuffer, bytesWritten);
 
+    if (framesWritten != 0) {
+        const float *lastFrame = decodedSamples + (framesWritten - 1) * channelCount;
+        for (uint32_t channel = 0; channel < channelCount; channel++) {
+            m_LastQueuedSamples[channel] = lastFrame[channel];
+        }
+    }
+
     // Get buffered audio size
-    uint32_t availableBytes;
+    uint32_t availableBytes = 0;
     TPCircularBufferTail(&m_RingBuffer, &availableBytes);
     m_QueuedAudioSize.store(availableBytes);
 
     return true;
+}
+
+void CoreAudioRenderer::notifyAudioDiscontinuity()
+{
+    m_HadProducerDrop = true;
 }
 
 AUSpatialMixerOutputType CoreAudioRenderer::getSpatialMixerOutputType()

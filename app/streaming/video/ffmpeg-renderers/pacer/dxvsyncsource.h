@@ -35,7 +35,7 @@ public:
 
     virtual ~DxVsyncSource();
 
-    virtual bool initialize(SDL_Window* window, int) override;
+    virtual bool initialize(SDL_Window* window, double) override;
 
     virtual bool isAsync() override;
 

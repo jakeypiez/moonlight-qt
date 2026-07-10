@@ -201,10 +201,9 @@ void Session::arDecodeAndPlaySample(char* sampleData, int sampleLength)
 
     s_ActiveSession->m_AudioSampleCount++;
 
-    // If audio is muted, don't decode or play the audio
-    if (s_ActiveSession->m_AudioMuted) {
-        return;
-    }
+    // Keep decoding while muted because Opus packets are stateful. The decoded
+    // PCM is discarded below, allowing clean decoder continuity on unmute.
+    const bool audioMuted = s_ActiveSession->m_AudioMuted.load();
 
     if (s_ActiveSession->m_AudioRenderer != nullptr) {
         int sampleSize = s_ActiveSession->m_AudioRenderer->getAudioBufferSampleSize();
@@ -237,7 +236,48 @@ void Session::arDecodeAndPlaySample(char* sampleData, int sampleLength)
             SDL_assert(desiredBufferSize >= frameSize * samplesDecoded);
             desiredBufferSize = frameSize * samplesDecoded;
         }
+        else if (samplesDecoded < 0) {
+            static uint32_t decodeErrorCount = 0;
+            const int decodeError = samplesDecoded;
+            decodeErrorCount++;
+            if (decodeErrorCount == 1 || (decodeErrorCount % 200) == 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Opus audio decode failed: %s (%d); total errors: %u",
+                            opus_strerror(decodeError),
+                            decodeError,
+                            decodeErrorCount);
+            }
+
+            // Conceal a corrupt packet rather than creating a hole in the PCM
+            // timeline. A null Opus packet requests packet-loss concealment.
+            if (s_ActiveSession->m_AudioRenderer->getAudioBufferFormat() == IAudioRenderer::AudioFormat::Float32NE) {
+                samplesDecoded = opus_multistream_decode_float(s_ActiveSession->m_OpusDecoder,
+                                                               nullptr,
+                                                               0,
+                                                               (float*)buffer,
+                                                               desiredBufferSize / frameSize,
+                                                               0);
+            }
+            else {
+                samplesDecoded = opus_multistream_decode(s_ActiveSession->m_OpusDecoder,
+                                                         nullptr,
+                                                         0,
+                                                         (short*)buffer,
+                                                         desiredBufferSize / frameSize,
+                                                         0);
+            }
+
+            desiredBufferSize = samplesDecoded > 0 ? frameSize * samplesDecoded : 0;
+        }
         else {
+            desiredBufferSize = 0;
+        }
+
+        if (audioMuted || samplesDecoded < 0) {
+            s_ActiveSession->m_AudioRenderer->notifyAudioDiscontinuity();
+        }
+
+        if (audioMuted) {
             desiredBufferSize = 0;
         }
 

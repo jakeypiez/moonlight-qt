@@ -2,6 +2,34 @@
 
 [Moonlight PC](https://moonlight-stream.org) is an open source PC client for NVIDIA GameStream and [Sunshine](https://github.com/LizardByte/Sunshine).
 
+> [!IMPORTANT]
+> This is an experimental, performance-focused macOS fork maintained at
+> [jakeypiez/moonlight-qt](https://github.com/jakeypiez/moonlight-qt). For the
+> official cross-platform client, support, and stable releases, use
+> [moonlight-stream/moonlight-qt](https://github.com/moonlight-stream/moonlight-qt).
+
+## macOS performance fork
+
+This fork builds on Andy Grundman's native CoreAudio, spatial-audio, Metal, and
+frame-pacing work with a coordinated reliability and latency pass for Apple
+Silicon Macs:
+
+- hardened VideoToolbox-to-Metal frame ownership, drawable lifecycle, shutdown,
+  display migration, and main-thread AppKit interactions;
+- improved fixed-rate, VRR, and ProMotion pacing with safer display-link timing
+  and bounded frame queues;
+- synchronized HDR/EDR metadata and renderer state across display and settings
+  changes;
+- resilient CoreAudio playback with bounded jitter buffering, full-frame Opus
+  decoding, underrun hysteresis, smooth recovery, and packet-loss concealment;
+- corrected spatial-audio channel negotiation and safer AudioUnit lifecycle
+  handling; and
+- deterministic macOS dependency bundling so release builds launch with their
+  packaged Metal, Vulkan, FFmpeg, SDL, Opus, and libplacebo libraries.
+
+Apple Silicon release builds and detailed notes are available from this fork's
+[Releases](https://github.com/jakeypiez/moonlight-qt/releases) page.
+
 Moonlight also has mobile versions for [Android](https://github.com/moonlight-stream/moonlight-android) and [iOS](https://github.com/moonlight-stream/moonlight-ios).
 
 You can follow development on our [Discord server](https://moonlight-stream.org/discord) and help translate Moonlight into your language on [Weblate](https://hosted.weblate.org/projects/moonlight/moonlight-qt/).

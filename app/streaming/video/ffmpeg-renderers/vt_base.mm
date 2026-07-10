@@ -16,6 +16,7 @@
 
 VTBaseRenderer::VTBaseRenderer(IFFmpegRenderer::RendererType type) :
     IFFmpegRenderer(type),
+    m_HdrMetadataGeneration(0),
     m_HdrMetadataChanged(false),
     m_MasteringDisplayColorVolume(nullptr),
     m_ContentLightLevelInfo(nullptr),
@@ -26,6 +27,8 @@ VTBaseRenderer::VTBaseRenderer(IFFmpegRenderer::RendererType type) :
 }
 
 VTBaseRenderer::~VTBaseRenderer() {
+    std::lock_guard<std::mutex> lock(m_HdrMetadataMutex);
+
     if (m_MasteringDisplayColorVolume != nullptr) {
         CFRelease(m_MasteringDisplayColorVolume);
     }
@@ -121,6 +124,11 @@ bool VTBaseRenderer::checkDecoderCapabilities(id<MTLDevice> device, PDECODER_PAR
 }
 
 void VTBaseRenderer::setHdrMode(bool enabled) {
+    SS_HDR_METADATA hdrMetadata = {};
+    bool hasHdrMetadata = enabled && LiGetHdrMetadata(&hdrMetadata);
+
+    std::unique_lock<std::mutex> lock(m_HdrMetadataMutex);
+
     // Free existing HDR metadata
     if (m_MasteringDisplayColorVolume != nullptr) {
         CFRelease(m_MasteringDisplayColorVolume);
@@ -132,8 +140,7 @@ void VTBaseRenderer::setHdrMode(bool enabled) {
     }
 
     // Store new HDR metadata if available
-    SS_HDR_METADATA hdrMetadata;
-    if (enabled && LiGetHdrMetadata(&hdrMetadata)) {
+    if (hasHdrMetadata) {
         if (hdrMetadata.displayPrimaries[0].x != 0 && hdrMetadata.maxDisplayLuminance != 0) {
             // This data is all in big-endian
             struct {
@@ -177,15 +184,23 @@ void VTBaseRenderer::setHdrMode(bool enabled) {
         }
 
         m_OverrideNits = false;
+    }
+
+    m_HdrMetadataChanged = true;
+    ++m_HdrMetadataGeneration;
+
+    float minNits = m_MinNits;
+    float maxNits = m_MaxNits;
+    lock.unlock();
+
+    if (hasHdrMetadata) {
         DevUISettings::instance().SetConfig([=](DevUIConfig& config) {
-            config.minNits = m_MinNits;
-            config.maxNits = m_MaxNits;
+            config.minNits = minNits;
+            config.maxNits = maxNits;
         });
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "HDR Metadata updated from host: minDisplayLuminance %.4f, maxDisplayLuminance %.2f",
-                    m_MinNits, m_MaxNits);
+                    minNits, maxNits);
     }
-
-    m_HdrMetadataChanged = true;
 }

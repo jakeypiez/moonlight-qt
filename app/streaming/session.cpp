@@ -2100,13 +2100,13 @@ void Session::exec()
             switch (event.window.event) {
             case SDL_WINDOWEVENT_FOCUS_LOST:
                 if (m_Preferences->muteOnFocusLoss) {
-                    m_AudioMuted = true;
+                    m_AudioMuted.store(true);
                 }
                 m_InputHandler->notifyFocusLost();
                 break;
             case SDL_WINDOWEVENT_FOCUS_GAINED:
                 if (m_Preferences->muteOnFocusLoss) {
-                    m_AudioMuted = false;
+                    m_AudioMuted.store(false);
                 }
                 m_InputHandler->notifyFocusGained();
                 break;

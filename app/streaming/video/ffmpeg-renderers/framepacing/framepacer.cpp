@@ -7,8 +7,6 @@
 #include "streaming/qpc.h"
 
 #include <algorithm>
-#include <chrono>
-#include <thread>
 
 extern "C"
 {
@@ -55,8 +53,6 @@ extern "C"
 constexpr int FRAME_QUEUE_LOW = 1;
 constexpr int FRAME_QUEUE_HIGH = 3;
 
-using steady_clock = std::chrono::steady_clock;
-
 FramePacer& FramePacer::instance()
 {
     static FramePacer inst;
@@ -64,14 +60,18 @@ FramePacer& FramePacer::instance()
 }
 
 FramePacer::FramePacer():
+    m_Renderer(nullptr),
     m_StreamFps(0),
+    m_RendererAttributes(0),
     m_RemoteAnchorPts(0),
     m_LocalAnchorUs(0),
     m_RenderThread(nullptr),
     m_VsyncThread(nullptr),
+    m_VsyncSource(nullptr),
     m_LastSyncQpc(0),
     m_VsyncIntervalQpc(0),
-    m_ewmaVsyncDriftQpc(MsToQpc(0.0001))
+    m_ewmaVsyncDriftQpc(MsToQpc(0.0001)),
+    m_LastVsyncDeadline(0.0)
 {}
 
 void FramePacer::initPacingMode(int pacingMode)
@@ -89,8 +89,25 @@ bool FramePacer::initialize(IFFmpegRenderer* renderer, PDECODER_PARAMETERS param
     m_RendererAttributes = m_Renderer->getRendererAttributes();
     m_Stopping.store(false);
 
+    // FramePacer is a singleton, so explicitly discard timing state from the
+    // previous stream/display before starting a new source. Reusing stale
+    // phase data can mis-schedule the first frames after a decoder reset or a
+    // move between displays with different refresh rates.
+    m_RemoteAnchorPts = 0;
+    m_LocalAnchorUs = 0;
+    m_CurrentFramePts.store(0);
+    m_LastSyncTargetQpc.store(0);
+    m_VsyncTimestamp.store(0.0);
+    {
+        std::scoped_lock<std::mutex> lock(m_FrameStatsLock);
+        m_LastSyncQpc = 0;
+        m_VsyncIntervalQpc = 0;
+        m_ewmaVsyncDriftQpc = 0.0;
+        m_LastVsyncDeadline = 0.0;
+    }
+
     // The frame pacing mode comes from Prefs, and is set prior to us being called
-    int pacingMode = StreamingPreferences::FRAME_PACING_IMMEDIATE;
+    int pacingMode = m_FramePacingMode.load();
     if (m_PendingPacingMode != -1) {
         pacingMode = m_PendingPacingMode;
         m_FramePacingMode.store(m_PendingPacingMode);
@@ -160,14 +177,17 @@ bool FramePacer::initialize(IFFmpegRenderer* renderer, PDECODER_PARAMETERS param
 
         SDL_assert(m_VsyncSource != nullptr || !(m_RendererAttributes & RENDERER_ATTRIBUTE_FORCE_PACING));
 
-        if (m_VsyncSource != nullptr && !m_VsyncSource->initialize(window, (int) m_RefreshRate.hz)) {
+        if (m_VsyncSource != nullptr && !m_VsyncSource->initialize(window, m_RefreshRate.hz)) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "Vsync source failed to initialize. Frame pacing will not be available!");
             delete m_VsyncSource;
             m_VsyncSource = nullptr;
         }
 
-        if (m_VsyncSource != nullptr) {
+        // Asynchronous sources invoke signalVsyncTS() directly from their
+        // callback. A second thread that only wakes for every callback adds a
+        // context switch without doing any work.
+        if (m_VsyncSource != nullptr && !m_VsyncSource->isAsync()) {
             m_VsyncThread = SDL_CreateThread(FramePacer::vsyncThread, "FramePacerVsync", this);
         }
     }
@@ -254,7 +274,7 @@ int FramePacer::renderThread(void* context)
 
     // Don't run the main loop until the first frame is available
     while (!FrameQueue::instance().count() && !me->stopping()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        FrameQueue::instance().waitForEnqueue(1, 1000.0);
     }
 
     while (!me->stopping()) {
@@ -290,6 +310,15 @@ int FramePacer::renderThread(void* context)
             continue;
         }
 
+        // Immediate mode may have waited a long time for a low-frame-rate
+        // stream. Refresh the presentation target now instead of handing the
+        // renderer a vblank deadline calculated before that wait.
+        if (isImmediate) {
+            uint64_t presentNow;
+            presentTargetQpc = me->getNextVBlankQpc(&presentNow);
+            deadline = presentTargetQpc;
+        }
+
         // When running without vsync, try an experimental sleep to hit vblank. In theory this should be the
         // lowest possible latency, but everything depends on the sleep being very precise.
         bool vsyncEnabled = me->m_Renderer->isVsyncEnabled();
@@ -303,7 +332,7 @@ int FramePacer::renderThread(void* context)
         t5 = QpcNow();
 
         // Graph frametime only for new frames
-        bool isRepeatFrame = true;
+        [[maybe_unused]] bool isRepeatFrame = true;
         int64_t currentFramePts = me->getCurrentFramePts();
         if (currentFramePts != lastFramePts) {
             if (lastPresentTime > 0) {
@@ -434,15 +463,19 @@ bool FramePacer::renderModeImmediate()
     int droppedCount = 0;
     int queueDepth = static_cast<int>(FrameQueue::instance().count());
 
-    // If we are behind, catch up by taking one more frame and dropping the older one.
-    if (queueDepth > FRAME_QUEUE_LOW) {
+    // If we are behind, drain the decoded queue and render the freshest frame.
+    // Keeping an older decoded frame adds latency without preserving decoder
+    // dependencies, because dependency handling has already completed.
+    while (queueDepth > 0) {
         AVFrame* newerFrame = FrameQueue::instance().dequeue();
-        if (newerFrame) {
-            FrameQueue::instance().dropFrame(newFrame);
-            newFrame = newerFrame;
-            droppedCount = 1;
-            --queueDepth;
+        if (!newerFrame) {
+            break;
         }
+
+        FrameQueue::instance().dropFrame(newFrame);
+        newFrame = newerFrame;
+        ++droppedCount;
+        --queueDepth;
     }
 
     if (m_CurrentFrame) {
@@ -565,28 +598,6 @@ int64_t FramePacer::getCurrentFramePts()
 
 // end main thread
 
-static inline int frameAttachUserdata(AVFrame* frame, int64_t prevPts)
-{
-    if (!frame) {
-        return AVERROR(EINVAL);
-    }
-
-    if (frame->opaque_ref) {
-        av_buffer_unref(&frame->opaque_ref);
-    }
-
-    AVBufferRef* buf = av_buffer_allocz(sizeof(MLFrameData));
-    if (!buf) {
-        return AVERROR(ENOMEM);
-    }
-
-    MLFrameData* data = (MLFrameData*) buf->data;
-    data->prevPts = prevPts;
-    frame->opaque_ref = buf;
-
-    return 0;
-}
-
 // called by decoder thread
 void FramePacer::submitFrame(AVFrame* frame)
 {
@@ -595,11 +606,11 @@ void FramePacer::submitFrame(AVFrame* frame)
         return;
     }
 
-    // Update cadence from pts, and store the previous frame's pts with this frame,
-    // which gives us the ability to accurately pace frames on a VRR display.
+    // Update cadence from PTS. Presentation-specific PTS tracking belongs to
+    // the renderer; attaching it through opaque_ref can overwrite metadata
+    // owned by hardware renderers and becomes stale when queued frames drop.
     if (frame->pts) {
-        int64_t prevPts = FrameCadence::instance().observeFramePts(frame->pts);
-        frameAttachUserdata(frame, prevPts);
+        FrameCadence::instance().observeFramePts(frame->pts);
 
         // If this is the first frame we've seen, set our anchor point
         if (m_RemoteAnchorPts == 0) {
@@ -709,13 +720,12 @@ void FramePacer::signalVsyncTS(double timestamp, double deadline)
         }
     }
 
-    static double lastDeadline = 0.0;
-    if (lastDeadline > 0.0) {
-        double interval = deadline - lastDeadline;
+    if (m_LastVsyncDeadline > 0.0) {
+        [[maybe_unused]] double interval = deadline - m_LastVsyncDeadline;
         FQLog("signalVsyncTS(): interval %.3fms timestamp %f, deadline %f, drift %.3f (avg %.3f)\n",
             interval * 1000.0, timestamp, deadline, QpcToMs(driftQpc), QpcToMs(m_ewmaVsyncDriftQpc));
     }
-    lastDeadline = deadline;
+    m_LastVsyncDeadline = deadline;
 
     m_WaitVsync.notify_all();
 }

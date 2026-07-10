@@ -254,11 +254,14 @@ public:
         }
 
         // Attach HDR metadata if it has been provided by the host
-        if (m_MasteringDisplayColorVolume != nullptr) {
-            CVBufferSetAttachment(pixBuf, kCVImageBufferMasteringDisplayColorVolumeKey, m_MasteringDisplayColorVolume, kCVAttachmentMode_ShouldPropagate);
-        }
-        if (m_ContentLightLevelInfo != nullptr) {
-            CVBufferSetAttachment(pixBuf, kCVImageBufferContentLightLevelInfoKey, m_ContentLightLevelInfo, kCVAttachmentMode_ShouldPropagate);
+        {
+            std::lock_guard<std::mutex> lock(m_HdrMetadataMutex);
+            if (m_MasteringDisplayColorVolume != nullptr) {
+                CVBufferSetAttachment(pixBuf, kCVImageBufferMasteringDisplayColorVolumeKey, m_MasteringDisplayColorVolume, kCVAttachmentMode_ShouldPropagate);
+            }
+            if (m_ContentLightLevelInfo != nullptr) {
+                CVBufferSetAttachment(pixBuf, kCVImageBufferContentLightLevelInfoKey, m_ContentLightLevelInfo, kCVAttachmentMode_ShouldPropagate);
+            }
         }
 
         // If the format has changed or doesn't exist yet, construct it with the

@@ -7,6 +7,8 @@
 #import <AVFoundation/AVFoundation.h>
 #import <QtGlobal>
 
+#include <cmath>
+
 // Global head tracking flag so it can be changed from DevUI and survive the decoder being
 // destroyed and recreated.
 std::atomic<bool> g_HeadTracking{false};
@@ -47,12 +49,12 @@ void AUSpatialRenderer::cleanup()
         return;
     }
 
-    clearCallback();
-
     if (m_Initialized) {
         AudioUnitUninitialize(m_Mixer);
         m_Initialized = false;
     }
+
+    clearCallback();
 
     AudioComponentInstanceDispose(m_Mixer);
     m_Mixer = nullptr;
@@ -90,9 +92,14 @@ void AUSpatialRenderer::setHeadTracking(bool enabled)
     g_HeadTracking.store(enabled);
 }
 
-void AUSpatialRenderer::setRingBufferPtr(const TPCircularBuffer *buffer)
+void AUSpatialRenderer::setRingBufferPtr(TPCircularBuffer *buffer)
 {
     m_RingBufferPtr = buffer;
+}
+
+bool AUSpatialRenderer::takeUnderrun()
+{
+    return m_DidUnderrun.exchange(false);
 }
 
 OSStatus AUSpatialRenderer::setStreamFormatAndACL(float inSampleRate,
@@ -143,43 +150,117 @@ OSStatus inputCallback(void *inRefCon,
 {
     AUSpatialRenderer *me = (AUSpatialRenderer *)inRefCon;
 
+    if (ioData == nullptr || ioActionFlags == nullptr) {
+        return kAudio_ParamError;
+    }
+
+    bool invalidBuffer = false;
+    const uint32_t requestedBytesPerChannel = inNumberFrames * sizeof(float);
+
     // Clear the buffer
     for (uint32_t i = 0; i < ioData->mNumberBuffers; i++) {
-        memset((float *)ioData->mBuffers[i].mData, 0, inNumberFrames * sizeof(float));
+        AudioBuffer& buffer = ioData->mBuffers[i];
+        if (buffer.mData == nullptr || buffer.mDataByteSize < requestedBytesPerChannel) {
+            invalidBuffer = true;
+            continue;
+        }
+        memset(buffer.mData, 0, buffer.mDataByteSize);
     }
 
-    // Pull audio from playthrough buffer
-    uint32_t availableBytes;
-    float *ringBuffer = (float *)TPCircularBufferTail((TPCircularBuffer *)me->m_RingBufferPtr, &availableBytes);
-
-    // Total size of interleaved PCM for all channels
-    uint32_t channelCount = ioData->mNumberBuffers;
-    uint32_t wantedBytes  = channelCount * inNumberFrames * sizeof(float);
-
-    // Optionally force a minimum buffer size before playback
-    bool buffering = false;
-    float queuedAudioMs = (float)availableBytes / (48 * channelCount * sizeof(float));
-    if (queuedAudioMs < 20.0) {
-        buffering = true;
-    }
-
-    if (availableBytes < wantedBytes) {
-        // not enough data for all channels, note we are sending back a zeroed-out buffer
-        // This underrun is not always a problem, so it's not included in stats currently
-        // XXX this ioActionFlags with silence flag seems to get lost, instead of returning via
-        // AudioUnitRender() <- process() <- renderSpatialCallback()
+    if (invalidBuffer || me->m_RingBufferPtr == nullptr ||
+            ioData->mNumberBuffers != (uint32_t)me->m_InputChannelCount) {
         *ioActionFlags |= kAudioUnitRenderAction_OutputIsSilence;
+        me->m_DidUnderrun.store(true);
+        me->m_Rebuffering = true;
+        me->m_FadeInPending = true;
         return noErr;
     }
 
-    // de-interleave ringBuffer PCM data into per-channel buffers
+    // Pull audio from playthrough buffer
+    uint32_t availableBytes = 0;
+    float *ringBuffer = (float *)TPCircularBufferTail(me->m_RingBufferPtr, &availableBytes);
+
+    // Total size of interleaved PCM for all channels
+    uint32_t channelCount = me->m_InputChannelCount;
+    uint32_t wantedBytes  = channelCount * inNumberFrames * sizeof(float);
+
+    if (me->m_Rebuffering &&
+            (availableBytes < me->m_RebufferThresholdBytes || availableBytes < wantedBytes)) {
+        *ioActionFlags |= kAudioUnitRenderAction_OutputIsSilence;
+        me->m_DidUnderrun.store(true);
+        return noErr;
+    }
+
+    if (me->m_Rebuffering) {
+        me->m_Rebuffering = false;
+        me->m_FadeInPending = true;
+    }
+
+    const uint32_t bytesPerFrame = channelCount * sizeof(float);
+    const uint32_t availableFrames = availableBytes / bytesPerFrame;
+    const uint32_t framesCopied = qMin(inNumberFrames, availableFrames);
+
+    // De-interleave ringBuffer PCM data into per-channel buffers.
     const float zero = 0.0f;
     for (uint32_t channel = 0; channel < channelCount; channel++) {
         float *channelBuffer = (float *)ioData->mBuffers[channel].mData;
-        vDSP_vsadd(ringBuffer + channel, channelCount, &zero, channelBuffer, 1, inNumberFrames);
+        if (framesCopied != 0) {
+            vDSP_vsadd(ringBuffer + channel, channelCount, &zero, channelBuffer, 1, framesCopied);
+        }
     }
 
-    TPCircularBufferConsume((TPCircularBuffer *)me->m_RingBufferPtr, wantedBytes);
+    if (framesCopied != 0) {
+        TPCircularBufferConsume(me->m_RingBufferPtr, framesCopied * bytesPerFrame);
+    }
+
+    if (me->m_FadeInPending && framesCopied != 0) {
+        const uint32_t fadeFrames = qMin(framesCopied, me->m_FadeFrames);
+        for (uint32_t frame = 0; frame < fadeFrames; frame++) {
+            const float gain = fadeFrames == 1 ? 1.0f : (float)frame / (fadeFrames - 1);
+            for (uint32_t channel = 0; channel < channelCount; channel++) {
+                ((float *)ioData->mBuffers[channel].mData)[frame] *= gain;
+            }
+        }
+        me->m_FadeInPending = false;
+    }
+
+    if (framesCopied < inNumberFrames) {
+        me->m_DidUnderrun.store(true);
+        me->m_Rebuffering = true;
+        me->m_FadeInPending = true;
+
+        if (framesCopied != 0) {
+            const uint32_t fadeFrames = qMin(framesCopied, me->m_FadeFrames);
+            const uint32_t firstFadeFrame = framesCopied - fadeFrames;
+            for (uint32_t frame = 0; frame < fadeFrames; frame++) {
+                const float gain = fadeFrames == 1 ? 0.0f : 1.0f - (float)frame / (fadeFrames - 1);
+                for (uint32_t channel = 0; channel < channelCount; channel++) {
+                    ((float *)ioData->mBuffers[channel].mData)[firstFadeFrame + frame] *= gain;
+                }
+            }
+        }
+        else if (me->m_HasLastInput) {
+            const uint32_t fadeFrames = qMin(inNumberFrames, me->m_FadeFrames);
+            for (uint32_t frame = 0; frame < fadeFrames; frame++) {
+                const float gain = fadeFrames == 1 ? 0.0f : 1.0f - (float)frame / (fadeFrames - 1);
+                for (uint32_t channel = 0; channel < channelCount; channel++) {
+                    ((float *)ioData->mBuffers[channel].mData)[frame] = me->m_LastInputSamples[channel] * gain;
+                }
+            }
+        }
+        else {
+            *ioActionFlags |= kAudioUnitRenderAction_OutputIsSilence;
+        }
+
+        me->m_HasLastInput = false;
+    }
+    else if (framesCopied != 0) {
+        for (uint32_t channel = 0; channel < channelCount; channel++) {
+            me->m_LastInputSamples[channel] =
+                ((float *)ioData->mBuffers[channel].mData)[framesCopied - 1];
+        }
+        me->m_HasLastInput = true;
+    }
 
     // The Apple example included this but it doesn't seem to do anything?
     // (*ioActionFlags) = kAudioOfflineUnitRenderAction_Complete;
@@ -187,8 +268,23 @@ OSStatus inputCallback(void *inRefCon,
     return noErr;
 }
 
-bool AUSpatialRenderer::setup(AUSpatialMixerOutputType outputType, float sampleRate, int inChannelCount)
+bool AUSpatialRenderer::setup(AUSpatialMixerOutputType outputType,
+                              float sampleRate,
+                              int inChannelCount,
+                              int samplesPerFrame)
 {
+    m_InputChannelCount = inChannelCount;
+    const double packetDuration = (double)samplesPerFrame / sampleRate;
+    const double rebufferSeconds = qBound(0.010, packetDuration * 3.0, 0.020);
+    m_RebufferThresholdBytes = (uint32_t)ceil(rebufferSeconds * sampleRate) *
+                               inChannelCount * sizeof(float);
+    m_FadeFrames = qMax(1U, (uint32_t)ceil(0.001 * sampleRate));
+    m_Rebuffering = true;
+    m_FadeInPending = true;
+    m_HasLastInput = false;
+    m_DidUnderrun.store(false);
+    m_LastInputSamples.assign(inChannelCount, 0.0f);
+
      // Set the number of input elements (buses).
     uint32_t numInputs = 1;
     OSStatus status = AudioUnitSetProperty(m_Mixer, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0, &numInputs, sizeof(numInputs));

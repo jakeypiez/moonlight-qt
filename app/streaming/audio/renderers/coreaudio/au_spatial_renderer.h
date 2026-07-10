@@ -7,6 +7,9 @@
 
 #include <Limelight.h>
 
+#include <atomic>
+#include <vector>
+
 typedef void (^SimpleBlock)();
 
 class AUSpatialRenderer
@@ -20,12 +23,13 @@ public:
     double getAudioUnitLatency();
     bool getHeadTracking();
     void setHeadTracking(bool enabled);
-    void setRingBufferPtr(const TPCircularBuffer* __nonnull buffer);
+    void setRingBufferPtr(TPCircularBuffer* __nonnull buffer);
     void setStatsTrackRenderBlock(SimpleBlock _Nonnull);
-    bool setup(AUSpatialMixerOutputType outputType, float sampleRate, int inChannelCount);
+    bool setup(AUSpatialMixerOutputType outputType, float sampleRate, int inChannelCount, int samplesPerFrame);
     OSStatus setStreamFormatAndACL(float inSampleRate, AudioChannelLayoutTag inLayoutTag, AudioUnitScope inScope, AudioUnitElement inElement);
     OSStatus setOutputType(AUSpatialMixerOutputType outputType);
     OSStatus process(AudioBufferList* __nullable outputABL, AudioUnitRenderActionFlags* __nonnull ioActionFlags, const AudioTimeStamp* __nullable inTimestamp, uint32_t inNumberFrames);
+    bool takeUnderrun();
 
     friend OSStatus inputCallback(void * _Nonnull,
                     AudioUnitRenderActionFlags *_Nullable,
@@ -36,10 +40,18 @@ public:
     uint32_t m_PersonalizedHRTF;
 
 private:
-    AudioUnit _Nonnull m_Mixer;
-    const TPCircularBuffer* _Nonnull m_RingBufferPtr; // pointer to RingBuffer in the outer CoreAudioRenderer
-    SimpleBlock _Nonnull m_StatsTrackRenderBlock;
+    AudioUnit _Nullable m_Mixer = nullptr;
+    TPCircularBuffer* _Nullable m_RingBufferPtr = nullptr; // pointer to RingBuffer in the outer CoreAudioRenderer
+    SimpleBlock _Nullable m_StatsTrackRenderBlock = nullptr;
 
     bool m_Initialized = false;
-    double m_AudioUnitLatency;
+    bool m_Rebuffering = true;
+    bool m_FadeInPending = true;
+    bool m_HasLastInput = false;
+    int m_InputChannelCount = 0;
+    uint32_t m_RebufferThresholdBytes = 0;
+    uint32_t m_FadeFrames = 0;
+    std::vector<float> m_LastInputSamples;
+    std::atomic<bool> m_DidUnderrun{false};
+    double m_AudioUnitLatency = 0.0;
 };

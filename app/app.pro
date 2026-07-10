@@ -622,7 +622,22 @@ macx {
     QMAKE_BUNDLE_DATA += APP_BUNDLE_RESOURCES APP_BUNDLE_PLIST
 
     !disable-prebuilts {
-        APP_BUNDLE_FRAMEWORKS.files = $$files(../libs/mac/Frameworks/*.framework, true) $$files(../libs/mac/lib/*.dylib, true)
+        # Keep dylibs explicit so qmake generates required copy rules even if
+        # setup-deps.py refreshes the dependency directory after configuration.
+        APP_BUNDLE_FRAMEWORKS.files = \
+            $$files(../libs/mac/Frameworks/*.framework, true) \
+            $$PWD/../libs/mac/lib/libMoltenVK.dylib \
+            $$PWD/../libs/mac/lib/libSDL2.dylib \
+            $$PWD/../libs/mac/lib/libSDL2_ttf.dylib \
+            $$PWD/../libs/mac/lib/libSDL3.dylib \
+            $$PWD/../libs/mac/lib/libavcodec.62.dylib \
+            $$PWD/../libs/mac/lib/libavutil.60.dylib \
+            $$PWD/../libs/mac/lib/libcrypto.3.dylib \
+            $$PWD/../libs/mac/lib/libdiscord-rpc.dylib \
+            $$PWD/../libs/mac/lib/libopus.0.dylib \
+            $$PWD/../libs/mac/lib/libplacebo.dylib \
+            $$PWD/../libs/mac/lib/libssl.3.dylib \
+            $$PWD/../libs/mac/lib/libswscale.9.dylib
         APP_BUNDLE_FRAMEWORKS.path = Contents/Frameworks
 
         QMAKE_BUNDLE_DATA += APP_BUNDLE_FRAMEWORKS

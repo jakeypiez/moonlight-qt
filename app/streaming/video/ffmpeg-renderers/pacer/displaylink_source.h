@@ -13,7 +13,7 @@ public:
     DisplayLinkSource();
     virtual ~DisplayLinkSource();
 
-    virtual bool initialize(SDL_Window* window, int displayFps) override;
+    virtual bool initialize(SDL_Window* window, double displayFps) override;
     virtual void stop() override;
     virtual bool isAsync() override;
 
